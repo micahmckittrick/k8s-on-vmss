@@ -408,6 +408,55 @@ WORKER_SUBNET_ID=$(az network vnet subnet show \
   --name $SUBNET_WORKER \
   --query id -o tsv)
 
+> **Note:** Azure CLI 2.85.0 has a known bug where `az vmss create` with Flexible orchestration returns a JSON parse error (`Extra data: line 1 column 4`). Use the ARM REST API approach below, or upgrade to CLI 2.86.0+ when available.
+
+```bash
+# Option A: ARM REST API (works with CLI 2.85.0)
+PUBKEY=$(cat $SSH_KEY_PATH)
+python3 -c "
+import json, sys
+data = {
+  'location': '$LOCATION',
+  'sku': {'name': '$WORKER_VM_SIZE', 'capacity': 3},
+  'tags': {
+    'k8s.io/cluster-autoscaler/enabled': 'true',
+    'k8s.io/cluster-autoscaler/$CLUSTER_NAME': 'owned',
+    'kubernetes.io/cluster/$CLUSTER_NAME': 'owned'
+  },
+  'properties': {
+    'orchestrationMode': 'Flexible',
+    'platformFaultDomainCount': 1,
+    'virtualMachineProfile': {
+      'storageProfile': {
+        'imageReference': {'publisher': 'Canonical', 'offer': '0001-com-ubuntu-server-jammy', 'sku': '22_04-lts', 'version': 'latest'},
+        'osDisk': {'createOption': 'FromImage', 'diskSizeGB': 128, 'managedDisk': {'storageAccountType': 'Premium_LRS'}}
+      },
+      'osProfile': {
+        'computerNamePrefix': 'worker',
+        'adminUsername': '$ADMIN_USER',
+        'linuxConfiguration': {
+          'disablePasswordAuthentication': True,
+          'ssh': {'publicKeys': [{'path': '/home/$ADMIN_USER/.ssh/authorized_keys', 'keyData': sys.argv[1]}]}
+        }
+      },
+      'networkProfile': {
+        'networkApiVersion': '2020-11-01',
+        'networkInterfaceConfigurations': [{'name': 'nic', 'properties': {'primary': True, 'ipConfigurations': [{'name': 'ip', 'properties': {'subnet': {'id': sys.argv[2]}}}]}}]
+      }
+    }
+  }
+}
+print(json.dumps(data))
+" "$PUBKEY" "$WORKER_SUBNET_ID" > /tmp/vmss-body.json
+
+az rest --method PUT \
+  --url "https://management.azure.com/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.Compute/virtualMachineScaleSets/$WORKER_VMSS_NAME?api-version=2024-03-01" \
+  --body @/tmp/vmss-body.json \
+  --query "properties.provisioningState" -o tsv
+```
+
+```bash
+# Option B: az vmss create (CLI 2.86.0+)
 az vmss create \
   --resource-group $RESOURCE_GROUP \
   --name $WORKER_VMSS_NAME \
